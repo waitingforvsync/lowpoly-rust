@@ -12,6 +12,7 @@
 //! - Edges are hard unless listed in `soft_edges`.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -66,8 +67,29 @@ pub struct CornerData {
     pub uv: [f64; 2],
 }
 
+/// The part of a [`MeshData`] that an error refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataRef {
+    /// A face, by file id.
+    Face(u32),
+    /// A wire edge, by its vertex ids.
+    WireEdge(u32, u32),
+    /// A soft edge, by its vertex ids.
+    SoftEdge(u32, u32),
+}
+
+impl fmt::Display for DataRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Face(id) => write!(f, "face {id}"),
+            Self::WireEdge(a, b) => write!(f, "wire edge {a}-{b}"),
+            Self::SoftEdge(a, b) => write!(f, "soft edge {a}-{b}"),
+        }
+    }
+}
+
 /// Why [`MeshData`] could not be loaded.
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadMeshError {
     /// Two vertices share an id.
@@ -77,10 +99,15 @@ pub enum LoadMeshError {
     #[error("face id {0} already in use")]
     DuplicateFaceId(u32),
     /// A face or edge refers to a vertex id that isn't defined.
-    #[error("no vertex with id {0}")]
-    UnknownVertex(u32),
+    #[error("{referrer} refers to unknown vertex {vertex}")]
+    UnknownVertex {
+        /// The undefined vertex id.
+        vertex: u32,
+        /// What refers to it.
+        referrer: DataRef,
+    },
     /// A face is not valid in a manifold mesh.
-    #[error("invalid face {id}: {source}")]
+    #[error("invalid face {id}")]
     InvalidFace {
         /// The face's file id.
         id: u32,
@@ -88,7 +115,7 @@ pub enum LoadMeshError {
         source: MeshError,
     },
     /// A wire edge is not valid.
-    #[error("invalid wire edge {a}-{b}: {source}")]
+    #[error("invalid wire edge {a}-{b}")]
     InvalidWireEdge {
         /// First vertex id.
         a: u32,
@@ -102,61 +129,101 @@ pub enum LoadMeshError {
     UnknownSoftEdge(u32, u32),
 }
 
+/// File vertex ids mapped to mesh handles.
+enum VertIds {
+    /// Ids no larger than a small multiple of the vertex count, indexed directly.
+    Dense(Vec<Option<VertId>>),
+    /// Anything else.
+    Sparse(HashMap<u32, VertId>),
+}
+
+impl VertIds {
+    /// Maps each vertex in `verts` to the handle it gets when vertices are added in order.
+    fn new(verts: &[VertData]) -> Result<Self, LoadMeshError> {
+        let handles = verts.iter().map(|v| v.id).zip((0..).map(VertId::new));
+        let dense_limit = verts.len().saturating_mul(4).saturating_add(64);
+        let max_id = verts.iter().map(|v| v.id as usize).max().unwrap_or(0);
+        if max_id < dense_limit {
+            let mut ids = vec![None; max_id + 1];
+            for (id, handle) in handles {
+                if ids[id as usize].replace(handle).is_some() {
+                    return Err(LoadMeshError::DuplicateVertexId(id));
+                }
+            }
+            Ok(Self::Dense(ids))
+        } else {
+            let mut ids = HashMap::with_capacity(verts.len());
+            for (id, handle) in handles {
+                if ids.insert(id, handle).is_some() {
+                    return Err(LoadMeshError::DuplicateVertexId(id));
+                }
+            }
+            Ok(Self::Sparse(ids))
+        }
+    }
+
+    fn get(&self, id: u32, referrer: DataRef) -> Result<VertId, LoadMeshError> {
+        match self {
+            Self::Dense(ids) => ids.get(id as usize).copied().flatten(),
+            Self::Sparse(ids) => ids.get(&id).copied(),
+        }
+        .ok_or(LoadMeshError::UnknownVertex {
+            vertex: id,
+            referrer,
+        })
+    }
+}
+
 impl EditableMesh {
-    /// Builds a mesh from its stored form. Element order is preserved, as is each loop's
-    /// starting corner, so `EditableMesh::from_data(d).to_data()` reproduces `d` when its ids are already
-    /// dense and in order.
+    /// Builds a mesh from its stored form, assigning dense handles in file order. Each loop's
+    /// starting corner is preserved, so `from_data(d).to_data()` reproduces `d` exactly when its
+    /// vertex and face ids are already `0..n` in order and `next_vert_id`/`next_face_id` equal
+    /// the counts (as for any file written by [`to_data`](Self::to_data) from a mesh with no dead
+    /// elements).
     ///
     /// # Errors
     ///
     /// [`LoadMeshError`] if the data is not a valid manifold mesh.
     pub fn from_data(data: &MeshData) -> Result<Self, LoadMeshError> {
+        let ids = VertIds::new(&data.verts)?;
         let mut mesh = Self::new();
-        let mut verts: HashMap<u32, VertId> = HashMap::with_capacity(data.verts.len());
         for v in &data.verts {
-            let handle = mesh.add_vertex(DVec3::from(v.p));
-            if verts.insert(v.id, handle).is_some() {
-                return Err(LoadMeshError::DuplicateVertexId(v.id));
-            }
+            mesh.add_vertex(DVec3::from(v.p));
         }
-        let vert = |id: u32| {
-            verts
-                .get(&id)
-                .copied()
-                .ok_or(LoadMeshError::UnknownVertex(id))
-        };
 
         let mut face_ids: Vec<u32> = data.faces.iter().map(|f| f.id).collect();
         face_ids.sort_unstable();
         if let Some(w) = face_ids.windows(2).find(|w| w[0] == w[1]) {
             return Err(LoadMeshError::DuplicateFaceId(w[0]));
         }
+        // Corner buffers reused across faces.
+        let mut loops: Vec<Vec<Corner>> = Vec::new();
         for f in &data.faces {
-            let loops = f
-                .loops
-                .iter()
-                .map(|l| {
-                    l.iter()
-                        .map(|c| {
-                            Ok(Corner {
-                                v: vert(c.v)?,
-                                uv: DVec2::from(c.uv),
-                            })
-                        })
-                        .collect()
-                })
-                .collect::<Result<Vec<Vec<Corner>>, LoadMeshError>>()?;
+            loops.resize_with(f.loops.len(), Vec::new);
+            for (buffer, corners) in loops.iter_mut().zip(&f.loops) {
+                buffer.clear();
+                corners.iter().try_for_each(|c| {
+                    let v = ids.get(c.v, DataRef::Face(f.id))?;
+                    buffer.push(Corner {
+                        v,
+                        uv: DVec2::from(c.uv),
+                    });
+                    Ok(())
+                })?;
+            }
             mesh.add_face(&loops, MaterialId(f.material))
                 .map_err(|source| LoadMeshError::InvalidFace { id: f.id, source })?;
         }
 
         for &[a, b] in &data.wire_edges {
-            mesh.add_edge(vert(a)?, vert(b)?)
+            let referrer = DataRef::WireEdge(a, b);
+            mesh.add_edge(ids.get(a, referrer)?, ids.get(b, referrer)?)
                 .map_err(|source| LoadMeshError::InvalidWireEdge { a, b, source })?;
         }
         for &[a, b] in &data.soft_edges {
+            let referrer = DataRef::SoftEdge(a, b);
             let e = mesh
-                .find_edge(vert(a)?, vert(b)?)
+                .find_edge(ids.get(a, referrer)?, ids.get(b, referrer)?)
                 .ok_or(LoadMeshError::UnknownSoftEdge(a, b))?;
             mesh.set_shading(e, Shading::Soft);
         }
@@ -179,10 +246,9 @@ impl EditableMesh {
                 id: f.index(),
                 material: self.material(f).0,
                 loops: self
-                    .face_corners(f)
-                    .iter()
+                    .face_loops(f)
                     .map(|l| {
-                        l.iter()
+                        self.loop_corners(l)
                             .map(|c| CornerData {
                                 v: c.v.index(),
                                 uv: c.uv.to_array(),

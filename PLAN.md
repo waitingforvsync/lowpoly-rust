@@ -27,7 +27,7 @@ file and class layout is not a template.
 | Triangulation | `earcut` crate (Rust port of mapbox earcut, same algorithm as the original) |
 | Serialization | `serde` + `serde_json`. **Same JSON document format as the TS app**, so files open in either, and TS-saved files become test fixtures. |
 | Undo | Value-oriented: the document is an immutable-by-sharing value (`imbl` + `Arc`, chunked copy-on-write mesh arrays), history is a list of document values. See [Document model and undo](#document-model-and-undo). |
-| Errors | One error enum per area (`MeshError`, `IoError`, ...) with `thiserror`. Mesh primitives check preconditions before mutating, as in the original. |
+| Errors | One error enum per area (`MeshError`, `IoError`, ...) with `thiserror`. Mesh operators check every precondition before mutating, so errors leave the mesh unchanged. |
 | Web bundling | `trunk` (`index.html` + `Trunk.toml`); `wasm-opt` in release |
 | Lints | BeautifulRust clippy config as workspace `[lints]`; CI runs clippy with `-D warnings` for native and `wasm32-unknown-unknown` |
 | Tests | Port the original's vitest suites test-first, as **behaviour** tests against the new API (names map back to the originals; tests of TS-only internals such as the MeshData↔HalfEdge conversion become file-format round-trip tests). `validate()` runs in every test and after every command in debug builds. |
@@ -38,16 +38,18 @@ file and class layout is not a template.
 Cargo.toml                 workspace, shared [lints], [profile.release]
 crates/
   lowpoly-core/            pure model: no egui, no wgpu, no platform code
-    math/                  plane fit (Newell), projection, ray/segment helpers
-    mesh.rs                module root: re-exports only
-    mesh/                  EditableMesh (index-based half-edge), handles, primitives, Euler ops, validate
-    file_format.rs         MeshData + document DTOs (serde), TS-compatible JSON
+    math.rs                Newell normal, plane basis and projection, 2D polygon tests
+    planarity.rs           planarity tests and tolerances
+    mesh.rs                module root: mod declarations and re-exports only
+    mesh/                  EditableMesh (index-based half-edge): handles, queries, elements
+                           (add/remove), Euler ops, validate
+    mesh_data.rs           MeshData, the serialized mesh (serde, TS-compatible JSON)
     ops/                   push/pull, extrude, inset, loop cut, merge, dissolve, planarize, draw, ...
-    uv/                    projection, texture-lock continuation
+    uv.rs                  projection, texture continuation
     triangulate.rs
-    primitives.rs
+    primitives.rs          shape generators (box, cylinder, ...), as in the TS app
     document.rs            objects, materials, texture assets
-    cow_vec.rs             chunked copy-on-write array (structural sharing for meshes)
+    cow_vec.rs             chunked copy-on-write array (structural sharing for meshes), private
     history.rs             value history: entries of Document + selection, cursor, budget
     io/                    JSON, OBJ/MTL, GLB, zip (byte-in/byte-out, no file system)
   lowpoly-editor/          session logic, still pure and natively testable
@@ -75,7 +77,7 @@ on the host, and so the core cannot accidentally pick up a GPU or browser depend
 |---|---|---|
 | `MeshData` does two jobs: the file format, **and** the in-memory snapshot form for undo (the half-edge graph is converted to `MeshData` on every mesh edit and rebuilt from it on every undo) | A JS object graph of half-edges can't be cheaply cloned | **Still two forms, each with one job.** `MeshData` is only the serialized format (serde, TS-compatible), used at save/load/export. The runtime `EditableMesh` is index-based half-edge storage with structural sharing (see [Document model and undo](#document-model-and-undo)), so it is its own undo snapshot. No conversion on the edit/undo path. |
 | Command pattern: each command mutates the live document in `apply()` and hand-writes its inverse in `revert()` | OO idiom; no cheap snapshots | **Value-oriented history** (after Juan Pedro Bolívar Puente's immer/lager): the document is a value, history is a list of document values. No inverses to write or get wrong. |
-| Throw `MeshError`, catch, roll back pointer surgery | Exceptions | Ops return `Result<_, MeshError>` and run on a working copy of the document (cheap thanks to sharing). On error the copy is dropped, so a failed op can't leave a half-edited mesh, by construction. |
+| Throw `MeshError`, catch, roll back pointer surgery | Exceptions | Ops return `Result<_, MeshError>`. Each mesh operator checks everything that could fail before changing anything, so it is atomic without rollback; commands run on a working copy of the document (cheap thanks to sharing), which history drops on error. |
 | Preact signals; panels re-render on change | Reactive UI | egui immediate mode reads editor state each frame. UI events become an `Action` enum handled by the editor (also useful for tests and key bindings). |
 | `SceneSync` keeps a Three.js scene graph in sync with the document | Retained-mode renderer | No scene graph. The renderer caches GPU buffers, triangulation and normals per mesh, and detects change with `Arc::ptr_eq` (a pointer compare). Draw lists are rebuilt from the document each frame, which is cheap. |
 | Live previews mutate the document, then `notifyPreview()`; commit must reconstruct "before" | Shared mutable objects | A tool holds `preview: Option<Document>`; the renderer draws the preview if present, else the current document. Commit pushes it to history, cancel drops it. |
@@ -128,7 +130,7 @@ struct History { entries: Vec<Entry>, cursor: usize, saved: Option<Document> }
   lets versions share storage.
 - **`CowVec<T, const N: usize>`**: a two-level chunked array, `Arc<Vec<Arc<[T; N]>>>`. Cloning is
   O(1) (the chunk table is shared too); the first write after a clone copies the table and the one
-  chunk written. Reads are O(1) and cache-friendly. Chunk size is tunable (64). Chosen over
+  chunk written. Reads are O(1) and cache-friendly. Chunk length is sized per element type to about 4 KB (a power of two). Chosen over
   `imbl::Vector` for meshes because half-edge traversal is dominated by random reads and RRB tree
   walks would sit on the hot path. `imbl` is used at the document level only.
 - **Half-edges are allocated in twin pairs**: twin = `index ^ 1`, edge = `index / 2`, so twin and

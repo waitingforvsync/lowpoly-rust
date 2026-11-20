@@ -52,14 +52,22 @@ impl LowpolyApp {
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.navigate(ui, &response, rect);
 
+        // Draw the image on whole physical pixels: it is sampled with nearest filtering at 1:1,
+        // so a fractional rect would double or drop rows.
         let pixels_per_point = ui.ctx().pixels_per_point();
+        let snap = |p: egui::Pos2| (p.to_vec2() * pixels_per_point).round().to_pos2();
+        let (min, max) = (snap(rect.min), snap(rect.max));
         let size = [
-            physical_pixels(rect.width(), pixels_per_point),
-            physical_pixels(rect.height(), pixels_per_point),
+            physical_pixels(max.x - min.x),
+            physical_pixels(max.y - min.y),
         ];
         if let Some(texture) = self.viewport.render(&self.camera, size) {
+            let image_rect = Rect::from_min_max(
+                (min.to_vec2() / pixels_per_point).to_pos2(),
+                (max.to_vec2() / pixels_per_point).to_pos2(),
+            );
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            ui.painter().image(texture, rect, uv, Color32::WHITE);
+            ui.painter().image(texture, image_rect, uv, Color32::WHITE);
         }
     }
 
@@ -159,14 +167,14 @@ fn to_dvec2(v: egui::Vec2) -> DVec2 {
     DVec2::new(f64::from(v.x), f64::from(v.y))
 }
 
-/// Converts a length in points to whole physical pixels.
-fn physical_pixels(points: f32, pixels_per_point: f32) -> u32 {
+/// Converts a whole number of physical pixels held in an `f32` to `u32`.
+fn physical_pixels(pixels: f32) -> u32 {
     // Saturating float-to-int conversion: negative and NaN become 0.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "rounded, clamped viewport size"
     )]
-    let pixels = (points * pixels_per_point).round().max(0.0) as u32;
-    pixels
+    let whole = pixels.round().max(0.0) as u32;
+    whole
 }

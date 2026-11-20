@@ -27,11 +27,24 @@ pub enum MeshError {
     #[error("cannot add an edge from vertex {0} to itself")]
     SelfEdge(VertId),
     /// The two vertices are already joined by an edge.
-    #[error("edge {0}-{1} already exists")]
-    EdgeExists(VertId, VertId),
+    #[error("edge {a}-{b} already exists")]
+    EdgeExists {
+        /// One end.
+        a: VertId,
+        /// The other end.
+        b: VertId,
+    },
     /// Only edges with no face on either side can be removed directly.
-    #[error("edge {0}-{1} still borders a face")]
-    EdgeBordersFace(VertId, VertId),
+    #[error("edge {a}-{b} still borders a face")]
+    EdgeBordersFace {
+        /// One end.
+        a: VertId,
+        /// The other end.
+        b: VertId,
+    },
+    /// A coordinate or parameter is NaN or infinite.
+    #[error("non-finite input")]
+    NonFinite,
     /// A face needs at least one loop.
     #[error("a face needs at least one loop")]
     NoLoops,

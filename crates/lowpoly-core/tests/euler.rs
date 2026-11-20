@@ -3,7 +3,8 @@
 mod common;
 
 use common::{
-    assert_valid, cube_data, mesh, quad_data, square_with_hole_data, two_triangles_data, v,
+    assert_refused, assert_valid, cube_data, mesh, quad_data, square_with_hole_data,
+    two_triangles_data, v,
 };
 use glam::{DVec2, DVec3};
 use lowpoly_core::mesh::{Corner, EditableMesh, FaceId, HoleFill, MaterialId, MeshError, VertId};
@@ -122,6 +123,7 @@ fn split_edge_keeps_shading_on_both_halves() {
     let mid = m.split_edge(e, 0.5).unwrap();
     assert_eq!(m.shading(m.find_edge(v(0), mid).unwrap()), Shading::Soft);
     assert_eq!(m.shading(m.find_edge(mid, v(1)).unwrap()), Shading::Soft);
+    assert_valid(&m);
 }
 
 // ---- split_face ----
@@ -201,9 +203,10 @@ fn split_face_along_a_path_continues_the_texture() {
 fn split_face_rejects_a_path_out_of_the_plane() {
     let mut m = mesh(&quad_data());
     let path = [DVec3::new(0.5, 0.5, 0.3)];
-    assert_eq!(
-        m.split_face(FaceId::new(0), v(0), v(2), &path),
-        Err(MeshError::PathNotPlanar)
+    assert_refused(
+        &mut m,
+        |m| m.split_face(FaceId::new(0), v(0), v(2), &path),
+        &MeshError::PathNotPlanar,
     );
 }
 
@@ -233,11 +236,12 @@ fn join_faces_merges_two_triangles_into_a_quad() {
 fn join_faces_keeps_the_id_and_material_of_the_primary_side() {
     let mut m = mesh(&two_triangles_data());
     let e = m.find_edge(v(1), v(3)).unwrap();
-    let keep = m.face_of(m.edge_half_edge(e)).unwrap();
+    let keep = m.face_of(e.half_edge()).unwrap();
     let material = m.material(keep);
     let f = m.join_faces(e).unwrap();
     assert_eq!(f, keep);
     assert_eq!(m.material(f), material);
+    assert_valid(&m);
 }
 
 #[test]
@@ -345,25 +349,48 @@ fn add_hole_cuts_a_hole_and_can_fill_it() {
     assert_eq!(m.face_normal(fill), DVec3::Z);
     // The hole's edges are now interior edges between the outer face and the fill face.
     for h in m.loop_half_edges(added.hole) {
-        assert_eq!(m.face_of(m.twin(h)), Some(fill));
+        assert_eq!(m.face_of(h.twin()), Some(fill));
     }
 }
 
 #[test]
-fn add_hole_leaves_the_mesh_unchanged_when_refused() {
-    // The TS test forced a failure part-way through the rebuild with a clashing face id. Ids are
-    // allocated, so this checks a refusal after the hole vertices were created instead; partial
-    // rebuilds are covered by `transaction_rolls_back_every_change_on_error`.
+fn add_hole_rolls_back_completely_when_the_rebuilt_face_is_invalid() {
+    // The TS test forced a failure part-way through the rebuild with a clashing face id. Here the
+    // rebuilt face itself is invalid (the hole repeats a vertex), which passes the up-front checks
+    // and is caught by checking the rebuilt face before anything changes.
+    let mut m = mesh(&quad_data());
+    let mut inner = inner_square(&mut m, Winding::Clockwise);
+    inner.push(inner[0]);
+    assert_refused(
+        &mut m,
+        |m| m.add_hole(FaceId::new(0), &inner, HoleFill::Filled),
+        &MeshError::RepeatedVertex(inner[0].v),
+    );
+}
+
+#[test]
+fn add_hole_refuses_a_hole_out_of_the_plane() {
     let mut m = mesh(&quad_data());
     let mut inner = inner_square(&mut m, Winding::Clockwise);
     inner[1].v = m.add_vertex(DVec3::new(0.25, 0.75, 0.5)); // lifts one corner off the plane
-    let before = m.to_data();
-    assert_eq!(
-        m.add_hole(FaceId::new(0), &inner, HoleFill::Filled),
-        Err(MeshError::NotCoplanar)
+    assert_refused(
+        &mut m,
+        |m| m.add_hole(FaceId::new(0), &inner, HoleFill::Filled),
+        &MeshError::NotCoplanar,
     );
+}
+
+#[test]
+fn add_hole_can_leave_the_hole_open() {
+    let mut m = mesh(&quad_data());
+    let inner = inner_square(&mut m, Winding::Clockwise);
+    let added = m.add_hole(FaceId::new(0), &inner, HoleFill::Open).unwrap();
     assert_valid(&m);
-    assert_eq!(m.to_data(), before);
+    assert_eq!(added.fill, None);
+    assert!(
+        m.loop_half_edges(added.hole)
+            .all(|h| m.face_of(h.twin()).is_none())
+    );
 }
 
 #[test]
@@ -372,9 +399,10 @@ fn add_hole_rejects_vertices_already_in_the_face() {
     let a = m.add_vertex(DVec3::new(0.5, 0.5, 0.0));
     let b = m.add_vertex(DVec3::new(0.6, 0.5, 0.0));
     let corners = [Corner::at(v(0)), Corner::at(a), Corner::at(b)];
-    assert_eq!(
-        m.add_hole(FaceId::new(0), &corners, HoleFill::Open),
-        Err(MeshError::HoleVertexInFace)
+    assert_refused(
+        &mut m,
+        |m| m.add_hole(FaceId::new(0), &corners, HoleFill::Open),
+        &MeshError::HoleVertexInFace,
     );
 }
 
@@ -420,4 +448,169 @@ fn hole_operations_reject_a_loop_that_is_not_a_hole() {
     let face = FaceId::new(0);
     let outer = m.face_outer(face);
     assert_eq!(m.fill_hole(face, outer), Err(MeshError::NotAHole(outer)));
+}
+
+// ---- error paths and non-finite input (Rust-only) ----
+
+#[test]
+fn split_edge_rejects_a_non_finite_parameter() {
+    let mut m = mesh(&quad_data());
+    let e = m.find_edge(v(0), v(1)).unwrap();
+    for t in [f64::NAN, f64::INFINITY] {
+        assert_refused(&mut m, |m| m.split_edge(e, t), &MeshError::NonFinite);
+    }
+}
+
+#[test]
+fn split_face_rejects_a_non_finite_path() {
+    let mut m = mesh(&quad_data());
+    let path = [DVec3::new(0.5, f64::NAN, 0.0)];
+    assert_refused(
+        &mut m,
+        |m| m.split_face(FaceId::new(0), v(0), v(2), &path),
+        &MeshError::NonFinite,
+    );
+}
+
+#[test]
+fn split_face_rejects_the_same_vertex_twice() {
+    let mut m = mesh(&quad_data());
+    assert_refused(
+        &mut m,
+        |m| m.split_face(FaceId::new(0), v(0), v(0), &[]),
+        &MeshError::SameVertex,
+    );
+}
+
+#[test]
+fn split_face_rejects_vertices_already_joined_by_an_edge() {
+    let mut m = mesh(&quad_data());
+    m.add_edge(v(0), v(2)).unwrap();
+    assert_refused(
+        &mut m,
+        |m| m.split_face(FaceId::new(0), v(0), v(2), &[]),
+        &MeshError::EdgeExists { a: v(0), b: v(2) },
+    );
+}
+
+#[test]
+fn join_faces_rejects_an_edge_on_a_hole_loop() {
+    let mut m = mesh(&square_with_hole_data());
+    let face = FaceId::new(0);
+    let hole = m.face_holes(face).next().unwrap();
+    m.fill_hole(face, hole).unwrap();
+    let e = m.find_edge(v(4), v(5)).unwrap();
+    assert_refused(&mut m, |m| m.join_faces(e), &MeshError::NotOuterLoops);
+}
+
+#[test]
+fn join_faces_rejects_faces_that_also_touch_at_a_vertex() {
+    // A square and a pentagon sharing edge 1-2 and, separately, vertex 3.
+    let mut m = EditableMesh::new();
+    let p: Vec<VertId> = [
+        [0.0, 0.0],
+        [2.0, 0.0],
+        [2.0, 2.0],
+        [0.0, 2.0],
+        [4.0, 0.0],
+        [3.0, 4.0],
+    ]
+    .iter()
+    .map(|&[x, y]| m.add_vertex(DVec3::new(x, y, 0.0)))
+    .collect();
+    let at = |is: &[usize]| -> Vec<Corner> { is.iter().map(|&i| Corner::at(p[i])).collect() };
+    m.add_face(&[at(&[0, 1, 2, 3])], M0).unwrap();
+    m.add_face(&[at(&[2, 1, 4, 3, 5])], M0).unwrap();
+    let e = m.find_edge(p[1], p[2]).unwrap();
+    assert_refused(&mut m, |m| m.join_faces(e), &MeshError::FacesTouch);
+}
+
+#[test]
+fn join_faces_rejects_a_hole_touching_the_other_face() {
+    // A square with a hole, and a triangle on the square's edge 1-2 whose third corner is a hole
+    // vertex: the merged face would visit that vertex twice.
+    let mut m = mesh(&square_with_hole_data());
+    m.add_face(
+        &[[Corner::at(v(2)), Corner::at(v(1)), Corner::at(v(6))]],
+        M0,
+    )
+    .unwrap();
+    let e = m.find_edge(v(1), v(2)).unwrap();
+    assert_refused(
+        &mut m,
+        |m| m.join_faces(e),
+        &MeshError::RepeatedVertex(v(6)),
+    );
+}
+
+#[test]
+fn remove_hole_rejects_a_loop_that_is_not_a_hole() {
+    let mut m = mesh(&square_with_hole_data());
+    let face = FaceId::new(0);
+    let outer = m.face_outer(face);
+    assert_refused(
+        &mut m,
+        |m| m.remove_hole(face, outer),
+        &MeshError::NotAHole(outer),
+    );
+}
+
+#[test]
+fn fill_hole_refuses_a_hole_that_is_already_filled() {
+    let mut m = mesh(&square_with_hole_data());
+    let face = FaceId::new(0);
+    let hole = m.face_holes(face).next().unwrap();
+    let fill = m.fill_hole(face, hole).unwrap();
+    let before = m.to_data();
+    let err = m.fill_hole(face, hole).expect_err("already filled");
+    assert!(
+        matches!(err, MeshError::HalfEdgeInUse { face: f, .. } if f == fill),
+        "{err}"
+    );
+    assert_eq!(m.to_data(), before);
+}
+
+#[test]
+fn operators_reject_dead_elements() {
+    let mut m = mesh(&quad_data());
+    let e = m.find_edge(v(0), v(1)).unwrap();
+    m.split_edge(e, 0.5).unwrap();
+    assert_refused(&mut m, |m| m.join_faces(e), &MeshError::NoSuchEdge(e));
+    let f = FaceId::new(0);
+    m.remove_face(f, lowpoly_core::mesh::RemoveFace::default())
+        .unwrap();
+    assert_refused(
+        &mut m,
+        |m| m.split_face(f, v(0), v(2), &[]),
+        &MeshError::NoSuchFace(f),
+    );
+}
+
+#[test]
+fn join_faces_refuses_bent_triangles_whose_loops_cancel_in_the_plane_fit() {
+    // Found by the property test: two triangles on the top (z = 1) and left (x = 0) sides of a
+    // cube. Their concatenated loops repeat the shared edge, which made the TS planarity check
+    // see a degenerate plane and accept the join.
+    let mut m = EditableMesh::new();
+    let p: Vec<VertId> = [
+        [0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.5, 1.0],
+        [0.0, 1.0, 0.05],
+    ]
+    .iter()
+    .map(|&q| m.add_vertex(DVec3::from(q)))
+    .collect();
+    m.add_face(
+        &[[Corner::at(p[0]), Corner::at(p[1]), Corner::at(p[2])]],
+        M0,
+    )
+    .unwrap();
+    m.add_face(
+        &[[Corner::at(p[1]), Corner::at(p[0]), Corner::at(p[3])]],
+        M0,
+    )
+    .unwrap();
+    let e = m.find_edge(p[0], p[1]).unwrap();
+    assert_refused(&mut m, |m| m.join_faces(e), &MeshError::NotCoplanar);
 }

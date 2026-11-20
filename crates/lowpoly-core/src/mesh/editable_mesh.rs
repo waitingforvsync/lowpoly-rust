@@ -4,7 +4,7 @@
 use glam::{DVec2, DVec3};
 
 use super::{EdgeId, FaceId, HalfEdgeId, LoopId, MaterialId, VertId};
-use crate::cow_vec::CowVec;
+use crate::cow_vec::{CowVec, chunk_len};
 use crate::math::newell_normal;
 
 /// How shading treats an edge.
@@ -78,21 +78,51 @@ pub(super) struct LiveCounts {
     pub(super) faces: usize,
 }
 
+// Chunk lengths sized to about 4 KB per chunk for each element type.
+const POSITION_CHUNK: usize = chunk_len(size_of::<DVec3>());
+const VERT_CHUNK: usize = chunk_len(size_of::<VertRecord>());
+const HALF_EDGE_CHUNK: usize = chunk_len(size_of::<HalfEdgeRecord>());
+const UV_CHUNK: usize = chunk_len(size_of::<DVec2>());
+const EDGE_CHUNK: usize = chunk_len(size_of::<EdgeRecord>());
+const LOOP_CHUNK: usize = chunk_len(size_of::<LoopRecord>());
+const FACE_CHUNK: usize = chunk_len(size_of::<FaceRecord>());
+
 /// An editable polygon mesh with n-gon faces, holes, per-corner UVs and wire edges.
 ///
-/// See the [module documentation](super) for the structure. Queries taking a handle expect a
-/// live element of this mesh and may panic otherwise; fallible operations check their inputs and
-/// return [`MeshError`](super::MeshError) instead, leaving the mesh unchanged.
+/// See the [module documentation](super) for the structure.
+///
+/// Queries taking a handle expect a live element of this mesh. A dead handle returns
+/// unspecified (but memory-safe) values, and debug builds assert; an out-of-range handle panics.
+/// Code that holds handles across edits, such as a selection carried over an undo, checks them
+/// with the `contains_*` methods. Fallible operations check their inputs and return
+/// [`MeshError`](super::MeshError) instead, leaving the mesh unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct EditableMesh {
-    pub(super) positions: CowVec<DVec3>,
-    pub(super) verts: CowVec<VertRecord>,
-    pub(super) half_edges: CowVec<HalfEdgeRecord>,
-    pub(super) uvs: CowVec<DVec2>,
-    pub(super) edges: CowVec<EdgeRecord>,
-    pub(super) loops: CowVec<LoopRecord>,
-    pub(super) faces: CowVec<FaceRecord>,
+    pub(super) positions: CowVec<DVec3, POSITION_CHUNK>,
+    pub(super) verts: CowVec<VertRecord, VERT_CHUNK>,
+    pub(super) half_edges: CowVec<HalfEdgeRecord, HALF_EDGE_CHUNK>,
+    pub(super) uvs: CowVec<DVec2, UV_CHUNK>,
+    pub(super) edges: CowVec<EdgeRecord, EDGE_CHUNK>,
+    pub(super) loops: CowVec<LoopRecord, LOOP_CHUNK>,
+    pub(super) faces: CowVec<FaceRecord, FACE_CHUNK>,
     pub(super) live: LiveCounts,
+}
+
+// Meshes are shared with background work (autosave) and between undo states.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<EditableMesh>();
+};
+
+/// Indices of the records for which `alive` holds.
+fn live_slots<R: Copy, const N: usize>(
+    records: &CowVec<R, N>,
+    alive: fn(&R) -> bool,
+) -> impl Iterator<Item = usize> + '_ {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, r)| alive(r).then_some(i))
 }
 
 impl EditableMesh {
@@ -128,29 +158,17 @@ impl EditableMesh {
 
     /// Live vertices, in index order.
     pub fn verts(&self) -> impl Iterator<Item = VertId> + '_ {
-        self.verts
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.alive)
-            .map(|(i, _)| VertId::from_slot(i))
+        live_slots(&self.verts, |r| r.alive).map(VertId::from_slot)
     }
 
     /// Live edges, in index order.
     pub fn edges(&self) -> impl Iterator<Item = EdgeId> + '_ {
-        self.edges
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.alive)
-            .map(|(i, _)| EdgeId::from_slot(i))
+        live_slots(&self.edges, |r| r.alive).map(EdgeId::from_slot)
     }
 
     /// Live faces, in index order.
     pub fn faces(&self) -> impl Iterator<Item = FaceId> + '_ {
-        self.faces
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.alive)
-            .map(|(i, _)| FaceId::from_slot(i))
+        live_slots(&self.faces, |r| r.alive).map(FaceId::from_slot)
     }
 
     /// Whether `v` is a live vertex of this mesh.
@@ -161,6 +179,11 @@ impl EditableMesh {
     /// Whether `e` is a live edge of this mesh.
     pub fn contains_edge(&self, e: EdgeId) -> bool {
         self.edges.get(e.slot()).is_some_and(|r| r.alive)
+    }
+
+    /// Whether `h` is a half-edge of a live edge of this mesh.
+    pub fn contains_half_edge(&self, h: HalfEdgeId) -> bool {
+        self.contains_edge(h.edge())
     }
 
     /// Whether `f` is a live face of this mesh.
@@ -177,16 +200,19 @@ impl EditableMesh {
 
     /// Position of a vertex.
     pub fn position(&self, v: VertId) -> DVec3 {
+        debug_assert!(self.contains_vert(v), "dead or unknown vertex {v}");
         self.positions[v.slot()]
     }
 
     /// Moves a vertex. Callers keep faces planar (see `planarity`).
     pub fn set_position(&mut self, v: VertId, p: DVec3) {
+        debug_assert!(self.contains_vert(v), "dead or unknown vertex {v}");
         self.positions[v.slot()] = p;
     }
 
     /// Outgoing half-edges of a vertex, in no particular order.
-    pub fn outgoing(&self, v: VertId) -> impl Iterator<Item = HalfEdgeId> + '_ {
+    pub fn outgoing(&self, v: VertId) -> impl Iterator<Item = HalfEdgeId> + Clone + '_ {
+        debug_assert!(self.contains_vert(v), "dead or unknown vertex {v}");
         std::iter::successors(self.verts[v.slot()].first_out, |h| {
             self.half_edges[h.slot()].next_out
         })
@@ -201,36 +227,30 @@ impl EditableMesh {
 
     /// The vertex a half-edge starts from.
     pub fn origin(&self, h: HalfEdgeId) -> VertId {
+        debug_assert!(self.contains_half_edge(h), "dead or unknown half-edge {h}");
         self.half_edges[h.slot()].origin
     }
 
     /// The vertex a half-edge points to.
     pub fn dest(&self, h: HalfEdgeId) -> VertId {
-        self.origin(self.twin(h))
-    }
-
-    /// The opposite half-edge of the same edge.
-    pub fn twin(&self, h: HalfEdgeId) -> HalfEdgeId {
-        HalfEdgeId::new(h.index() ^ 1)
-    }
-
-    /// The edge a half-edge belongs to.
-    pub fn edge_of(&self, h: HalfEdgeId) -> EdgeId {
-        EdgeId::new(h.index() / 2)
+        self.origin(h.twin())
     }
 
     /// The next half-edge around its loop, or `None` on the open boundary.
     pub fn next(&self, h: HalfEdgeId) -> Option<HalfEdgeId> {
+        debug_assert!(self.contains_half_edge(h), "dead or unknown half-edge {h}");
         self.half_edges[h.slot()].next
     }
 
     /// The previous half-edge around its loop, or `None` on the open boundary.
     pub fn prev(&self, h: HalfEdgeId) -> Option<HalfEdgeId> {
+        debug_assert!(self.contains_half_edge(h), "dead or unknown half-edge {h}");
         self.half_edges[h.slot()].prev
     }
 
     /// The loop a half-edge belongs to, or `None` on the open boundary.
     pub fn loop_of(&self, h: HalfEdgeId) -> Option<LoopId> {
+        debug_assert!(self.contains_half_edge(h), "dead or unknown half-edge {h}");
         self.half_edges[h.slot()].loop_id
     }
 
@@ -241,61 +261,63 @@ impl EditableMesh {
 
     /// The UV of the face corner at the half-edge's origin. (0, 0) on the open boundary.
     pub fn uv(&self, h: HalfEdgeId) -> DVec2 {
+        debug_assert!(self.contains_half_edge(h), "dead or unknown half-edge {h}");
         self.uvs[h.slot()]
     }
 
-    /// Sets the UV of the face corner at the half-edge's origin.
+    /// Sets the UV of the face corner at the half-edge's origin. The half-edge must be on a
+    /// face; boundary half-edges have no corner.
     pub fn set_uv(&mut self, h: HalfEdgeId, uv: DVec2) {
+        debug_assert!(
+            self.loop_of(h).is_some(),
+            "half-edge {h} has no face corner"
+        );
         self.uvs[h.slot()] = uv;
     }
 
     // ---- edges ----
 
-    /// The edge's primary half-edge: the one created first, running from its first vertex to
-    /// its second.
-    pub fn edge_half_edge(&self, e: EdgeId) -> HalfEdgeId {
-        HalfEdgeId::new(e.index() * 2)
-    }
-
     /// The edge's endpoints, in the direction of its primary half-edge.
     pub fn edge_verts(&self, e: EdgeId) -> [VertId; 2] {
-        let h = self.edge_half_edge(e);
+        let h = e.half_edge();
         [self.origin(h), self.dest(h)]
     }
 
     /// Faces on either side of an edge (0, 1 or 2).
     pub fn edge_faces(&self, e: EdgeId) -> impl Iterator<Item = FaceId> + use<> {
-        let h = self.edge_half_edge(e);
+        let h = e.half_edge();
         let a = self.face_of(h);
-        let b = self.face_of(self.twin(h)).filter(|b| Some(*b) != a);
+        let b = self.face_of(h.twin()).filter(|b| Some(*b) != a);
         a.into_iter().chain(b)
     }
 
     /// Whether neither side of the edge has a face.
     pub fn is_wire(&self, e: EdgeId) -> bool {
-        let h = self.edge_half_edge(e);
-        self.loop_of(h).is_none() && self.loop_of(self.twin(h)).is_none()
+        let h = e.half_edge();
+        self.loop_of(h).is_none() && self.loop_of(h.twin()).is_none()
     }
 
     /// Whether exactly one side of the edge has a face.
     pub fn is_boundary(&self, e: EdgeId) -> bool {
-        let h = self.edge_half_edge(e);
-        self.loop_of(h).is_none() != self.loop_of(self.twin(h)).is_none()
+        let h = e.half_edge();
+        self.loop_of(h).is_none() != self.loop_of(h.twin()).is_none()
     }
 
     /// The edge's shading.
     pub fn shading(&self, e: EdgeId) -> Shading {
+        debug_assert!(self.contains_edge(e), "dead or unknown edge {e}");
         self.edges[e.slot()].shading
     }
 
     /// Sets the edge's shading.
     pub fn set_shading(&mut self, e: EdgeId, shading: Shading) {
+        debug_assert!(self.contains_edge(e), "dead or unknown edge {e}");
         self.edges[e.slot()].shading = shading;
     }
 
     /// The edge joining two vertices, if any. O(valence of `a`).
     pub fn find_edge(&self, a: VertId, b: VertId) -> Option<EdgeId> {
-        self.find_half_edge(a, b).map(|h| self.edge_of(h))
+        self.find_half_edge(a, b).map(HalfEdgeId::edge)
     }
 
     /// The half-edge running from `a` to `b`, if the edge exists. O(valence of `a`).
@@ -307,6 +329,7 @@ impl EditableMesh {
 
     /// The face a loop bounds.
     pub fn loop_face(&self, l: LoopId) -> FaceId {
+        debug_assert!(self.contains_loop(l), "dead or unknown loop {l}");
         self.loops[l.slot()].face
     }
 
@@ -316,79 +339,96 @@ impl EditableMesh {
     }
 
     /// The half-edges around a loop, starting from its first.
-    pub fn loop_half_edges(&self, l: LoopId) -> impl Iterator<Item = HalfEdgeId> + '_ {
-        let first = self.loops[l.slot()].first;
-        std::iter::successors(Some(first), move |&h| self.next(h).filter(|&n| n != first))
+    pub fn loop_half_edges(&self, l: LoopId) -> impl Iterator<Item = HalfEdgeId> + Clone + '_ {
+        debug_assert!(self.contains_loop(l), "dead or unknown loop {l}");
+        self.half_edges_from(self.loops[l.slot()].first)
+    }
+
+    /// The half-edges around a loop, starting from `start`. A boundary half-edge has no loop, so
+    /// this yields just `start`.
+    pub fn half_edges_from(
+        &self,
+        start: HalfEdgeId,
+    ) -> impl Iterator<Item = HalfEdgeId> + Clone + '_ {
+        std::iter::successors(Some(start), move |&h| self.next(h).filter(|&n| n != start))
     }
 
     /// The vertices around a loop.
-    pub fn loop_verts(&self, l: LoopId) -> impl Iterator<Item = VertId> + '_ {
+    pub fn loop_verts(&self, l: LoopId) -> impl Iterator<Item = VertId> + Clone + '_ {
         self.loop_half_edges(l).map(|h| self.origin(h))
     }
 
     /// The positions around a loop.
-    pub fn loop_positions(&self, l: LoopId) -> Vec<DVec3> {
-        self.loop_verts(l).map(|v| self.position(v)).collect()
+    pub fn loop_positions(&self, l: LoopId) -> impl Iterator<Item = DVec3> + Clone + '_ {
+        self.loop_verts(l).map(|v| self.position(v))
     }
 
     /// The corners (vertex and UV) around a loop.
-    pub fn loop_corners(&self, l: LoopId) -> Vec<Corner> {
-        self.loop_half_edges(l)
-            .map(|h| Corner {
-                v: self.origin(h),
-                uv: self.uv(h),
-            })
-            .collect()
+    pub fn loop_corners(&self, l: LoopId) -> impl Iterator<Item = Corner> + Clone + '_ {
+        self.loop_half_edges(l).map(|h| self.corner(h))
+    }
+
+    /// The face corner at a half-edge's origin.
+    pub fn corner(&self, h: HalfEdgeId) -> Corner {
+        Corner {
+            v: self.origin(h),
+            uv: self.uv(h),
+        }
     }
 
     // ---- faces ----
 
     /// A face's outer loop.
     pub fn face_outer(&self, f: FaceId) -> LoopId {
+        debug_assert!(self.contains_face(f), "dead or unknown face {f}");
         self.faces[f.slot()].outer
     }
 
     /// A face's hole loops, in order.
-    pub fn face_holes(&self, f: FaceId) -> impl Iterator<Item = LoopId> + '_ {
+    pub fn face_holes(&self, f: FaceId) -> impl Iterator<Item = LoopId> + Clone + '_ {
         std::iter::successors(self.loops[self.face_outer(f).slot()].next_hole, |l| {
             self.loops[l.slot()].next_hole
         })
     }
 
     /// A face's loops: the outer loop, then its holes.
-    pub fn face_loops(&self, f: FaceId) -> impl Iterator<Item = LoopId> + '_ {
+    pub fn face_loops(&self, f: FaceId) -> impl Iterator<Item = LoopId> + Clone + '_ {
         std::iter::once(self.face_outer(f)).chain(self.face_holes(f))
     }
 
     /// Every half-edge of a face, over all its loops.
-    pub fn face_half_edges(&self, f: FaceId) -> impl Iterator<Item = HalfEdgeId> + '_ {
+    pub fn face_half_edges(&self, f: FaceId) -> impl Iterator<Item = HalfEdgeId> + Clone + '_ {
         self.face_loops(f).flat_map(|l| self.loop_half_edges(l))
     }
 
     /// Every vertex position of a face, over all its loops.
-    pub fn face_positions(&self, f: FaceId) -> Vec<DVec3> {
+    pub fn face_positions(&self, f: FaceId) -> impl Iterator<Item = DVec3> + Clone + '_ {
         self.face_half_edges(f)
             .map(|h| self.position(self.origin(h)))
-            .collect()
     }
 
-    /// The corners of each loop of a face: the outer loop, then its holes.
+    /// An owned snapshot of a face's corners, one list per loop (outer first, then holes), for
+    /// rebuilding the face. Allocates; use the iterator queries for reading.
     pub fn face_corners(&self, f: FaceId) -> Vec<Vec<Corner>> {
-        self.face_loops(f).map(|l| self.loop_corners(l)).collect()
+        self.face_loops(f)
+            .map(|l| self.loop_corners(l).collect())
+            .collect()
     }
 
     /// A face's material.
     pub fn material(&self, f: FaceId) -> MaterialId {
+        debug_assert!(self.contains_face(f), "dead or unknown face {f}");
         self.faces[f.slot()].material
     }
 
     /// Sets a face's material.
     pub fn set_material(&mut self, f: FaceId, material: MaterialId) {
+        debug_assert!(self.contains_face(f), "dead or unknown face {f}");
         self.faces[f.slot()].material = material;
     }
 
     /// Unit normal of a face, from its outer loop (Newell's method). Zero for a degenerate face.
     pub fn face_normal(&self, f: FaceId) -> DVec3 {
-        newell_normal(&self.loop_positions(self.face_outer(f))).normalize_or_zero()
+        newell_normal(self.loop_positions(self.face_outer(f))).normalize_or_zero()
     }
 }

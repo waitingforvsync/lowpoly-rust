@@ -4,6 +4,19 @@ use std::fmt;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
+/// Target size of one chunk in bytes. About a page: big enough that the chunk table stays short
+/// (copying it is the main cost of the first edit after a clone), small enough that copying one
+/// chunk is a cheap memcpy.
+const CHUNK_BYTES: usize = 4096;
+
+/// The chunk length for elements of `size` bytes: the largest power of two whose chunk fits in
+/// [`CHUNK_BYTES`] (a power of two so indexing compiles to a shift and a mask).
+pub(crate) const fn chunk_len(size: usize) -> usize {
+    let fit = CHUNK_BYTES / size;
+    assert!(fit > 0, "elements larger than a chunk");
+    1 << (usize::BITS - 1 - fit.leading_zeros())
+}
+
 /// A vector stored as fixed-size chunks behind [`Arc`]s, so clones share storage.
 ///
 /// The table of chunk pointers is itself shared, so cloning is O(1). The first write after a
@@ -14,7 +27,7 @@ use std::sync::Arc;
 /// Elements are `Copy`, and the unused tail of the last chunk is filled with copies of the
 /// element that started it, so no `Default` is needed.
 #[derive(Clone)]
-pub struct CowVec<T, const N: usize = 64> {
+pub(crate) struct CowVec<T, const N: usize> {
     #[expect(
         clippy::rc_buffer,
         reason = "the table is copied on write with Arc::make_mut, which needs a growable Vec"
@@ -23,8 +36,14 @@ pub struct CowVec<T, const N: usize = 64> {
     len: usize,
 }
 
+impl<T, const N: usize> CowVec<T, N> {
+    /// Rejects `N == 0` at compile time, where it would divide by zero.
+    const NON_EMPTY_CHUNKS: () = assert!(N > 0, "CowVec chunks need at least one element");
+}
+
 impl<T, const N: usize> Default for CowVec<T, N> {
     fn default() -> Self {
+        let () = Self::NON_EMPTY_CHUNKS;
         Self {
             chunks: Arc::new(Vec::new()),
             len: 0,
@@ -33,23 +52,13 @@ impl<T, const N: usize> Default for CowVec<T, N> {
 }
 
 impl<T: Copy, const N: usize> CowVec<T, N> {
-    /// Creates an empty vector.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Number of elements.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    /// Whether the vector has no elements.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Appends an element and returns its index.
-    pub fn push(&mut self, value: T) -> usize {
+    pub(crate) fn push(&mut self, value: T) -> usize {
         let index = self.len;
         let offset = index % N;
         let chunks = Arc::make_mut(&mut self.chunks);
@@ -62,13 +71,16 @@ impl<T: Copy, const N: usize> CowVec<T, N> {
     }
 
     /// The element at `index`, or `None` if it is out of range.
-    pub fn get(&self, index: usize) -> Option<&T> {
+    pub(crate) fn get(&self, index: usize) -> Option<&T> {
         (index < self.len).then(|| &self.chunks[index / N][index % N])
     }
 
-    /// Iterates over the elements in order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &T> + Clone + '_ {
-        (0..self.len).map(|i| &self.chunks[i / N][i % N])
+    /// Iterates over the elements in order, a chunk at a time.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> + Clone + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .take(self.len)
     }
 }
 
@@ -89,7 +101,7 @@ impl<T: Copy, const N: usize> Index<usize> for CowVec<T, N> {
 }
 
 impl<T: Copy, const N: usize> IndexMut<usize> for CowVec<T, N> {
-    /// Copies the containing chunk first if another clone shares it.
+    /// Copies the chunk table and the containing chunk first if another clone shares them.
     ///
     /// # Panics
     ///
@@ -112,11 +124,10 @@ impl<T: Copy + fmt::Debug, const N: usize> fmt::Debug for CowVec<T, N> {
 
 impl<T: Copy, const N: usize> FromIterator<T> for CowVec<T, N> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut v = Self::new();
-        for x in iter {
+        iter.into_iter().fold(Self::default(), |mut v, x| {
             v.push(x);
-        }
-        v
+            v
+        })
     }
 }
 
@@ -125,6 +136,14 @@ mod tests {
     use super::*;
 
     type Small = CowVec<u32, 4>;
+
+    #[test]
+    fn chunk_len_is_the_largest_power_of_two_that_fits() {
+        assert_eq!(chunk_len(24), 128); // 4096 / 24 = 170
+        assert_eq!(chunk_len(8), 512);
+        assert_eq!(chunk_len(2), 2048);
+        assert_eq!(chunk_len(4096), 1);
+    }
 
     #[test]
     fn push_get_and_iterate_across_chunks() {
@@ -137,19 +156,25 @@ mod tests {
             v.iter().copied().collect::<Vec<_>>(),
             (0..10).collect::<Vec<_>>()
         );
-        assert_eq!(v.iter().len(), 10);
         assert_eq!(v.chunks.len(), 3);
+    }
+
+    #[test]
+    fn clone_shares_the_chunk_table_until_written() {
+        let a: Small = (0..10).collect();
+        let mut b = a.clone();
+        assert!(Arc::ptr_eq(&a.chunks, &b.chunks), "clone is O(1)");
+        b[0] = 1;
+        assert!(
+            !Arc::ptr_eq(&a.chunks, &b.chunks),
+            "first write copies the table"
+        );
     }
 
     #[test]
     fn clone_shares_chunks_until_written() {
         let a: Small = (0..10).collect();
         let mut b = a.clone();
-        assert!(
-            (0..3).all(|i| Arc::ptr_eq(&a.chunks[i], &b.chunks[i])),
-            "clone shares every chunk"
-        );
-
         b[5] = 100;
         assert_eq!(a[5], 5, "the original is unchanged");
         assert_eq!(b[5], 100);
@@ -164,18 +189,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a.chunks[2], &b.chunks[2]),
             "untouched chunks stay shared"
-        );
-    }
-
-    #[test]
-    fn clone_shares_the_chunk_table_until_written() {
-        let a: Small = (0..10).collect();
-        let mut b = a.clone();
-        assert!(Arc::ptr_eq(&a.chunks, &b.chunks), "clone is O(1)");
-        b[0] = 1;
-        assert!(
-            !Arc::ptr_eq(&a.chunks, &b.chunks),
-            "first write copies the table"
         );
     }
 
@@ -195,6 +208,7 @@ mod tests {
         assert_eq!(a.len(), 6);
         assert_eq!(b.len(), 7);
         assert_eq!(b[6], 6);
+        assert_eq!(a.iter().count(), 6, "iteration stops at the length");
         assert!(
             Arc::ptr_eq(&a.chunks[0], &b.chunks[0]),
             "full chunks stay shared"

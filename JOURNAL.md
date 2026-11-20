@@ -24,8 +24,9 @@ way (with what they taught). See [PLAN.md](PLAN.md) for the roadmap.
   the GPU work when neither changed; egui itself only repaints on input.
 - **WebGL2 only on the web** for now (`Backends::GL` in `main.rs`); WebGPU is a one-line change.
 - **Lints**: BeautifulRust's set as `[workspace.lints]`, minus the library-only lints and
-  `as_conversions`; casts go through `From`/`TryFrom` or glam's `as_*` conversions, and the one
-  float-to-pixel cast carries an `#[expect]` with a reason.
+  `as_conversions`. Lossy casts go through `From`/`TryFrom` or glam's `as_*` conversions, or carry
+  an `#[expect]` with a reason; widening `u32 as usize` index casts and `size_of` casts in consts
+  remain.
 
 ### Mistakes
 - **Git Bash shadows the MSVC linker.** `/usr/bin/link` comes before `link.exe` on Git Bash's
@@ -84,3 +85,56 @@ way (with what they taught). See [PLAN.md](PLAN.md) for the roadmap.
   reach them.
 - `cargo bench -p lowpoly-core -- <criterion flags>` passes the flags to the lib's test harness
   too, which rejects them. Use `--bench mesh`.
+
+---
+
+## R1 review (2026-11-20)
+
+An adversarial review by two fresh agents (standards and correctness; performance, measured in a
+scratch copy). Everything recommended was applied except the `unsafe` fast path for `Arc`
+uniqueness checks (user decision: no unsafe code for now; `unsafe_code = "forbid"`).
+
+### Decisions
+- **Operators are atomic by checking, not by transaction.** Each Euler operator checks everything
+  that could fail, including the faces it would rebuild (`check_new_face`, which treats the faces
+  being rebuilt as freed), then mutates with infallible `kill_*`/`link_face` helpers. A nested
+  `transaction` re-shared every chunk table, so k chained operators cost O(k·n/64): 20 splits on a
+  10k-face mesh went from about 550 µs to 57 µs. `transaction` remains for multi-step edits.
+- **New handles are predictable** (storage is append-only), so operators build their final corner
+  lists before changing anything.
+- **Chunks are sized to about 4 KB per element type** (a power of two, so indexing stays a shift
+  and mask). Splitting an edge went from 27 µs to 11.5 µs; 1 KB chunks were measured and were
+  slower.
+- **Queries return iterators.** `loop_positions`, `loop_corners`, `face_positions`, and the math
+  and planarity functions take or return iterators, so callers don't allocate. `face_corners` is
+  the one owned snapshot, for rebuilding faces.
+- **Validation is bounded and reads raw records.** It must survive the corruption it reports, and
+  the accessors now `debug_assert` on dead handles.
+- **Handles carry their arithmetic**: `h.twin()`, `h.edge()`, `e.half_edge()` (overflow-checked).
+- **`face_uv_mapping` returns an enum**, not `Box<dyn Fn>`, so it is `Send` and allocation-free.
+- **A property test** (`tests/properties.rs`) runs random operator sequences: every result must
+  validate, every refusal must leave the mesh unchanged, and the mesh must survive save/load.
+- **Web build profile** `wasm-release`: dependencies at `opt-level = "s"` with fat LTO, our crates
+  at 3. 6.63 → 5.14 MB raw, about 2.45 → 2.06 MB gzipped. egui's bundled fonts stay for now.
+- **CI**: `--locked`, read-only permissions, concurrency cancellation, no duplicate PR runs, docs
+  with `-D warnings`. Dev builds use `opt-level = 1` for our crates.
+
+### Mistakes
+- **The TS `joinFaces` planarity check was wrong, and the port copied it.** Concatenating both
+  faces' loops repeats the shared edge; for two triangles every edge cancels in the Newell sum, the
+  normal is zero, and "degenerate" was treated as planar. The property test found it on its first
+  run. Fixed at both levels: `join_faces` tests the merged face, and `planar_deviation` falls back
+  to a well-spread triangle when the Newell normal is degenerate. *Lesson: a degenerate normal
+  means "unknown", not "planar".*
+- **Infinite points slipped past the first NaN fix**: an infinite point makes the tolerance
+  infinite too, so `inf <= inf` passed. `is_planar` now requires a finite deviation.
+- **Benchmarking with `trunk serve` running** (it rebuilds on every file change) made the build
+  benchmark look 25% slower. Back-to-back runs of the R1 commit (in a worktree) and the new code on
+  a quiet machine showed no regression. *Lesson: compare against a baseline measured in the same
+  session, and stop background watchers first.*
+- `PROPTEST_CASES` was ignored because the test set `with_cases(256)` explicitly; the default is
+  already 256 and honours the variable.
+- **Python's default encoding on this machine is cp1252.** An edit script failed while writing a
+  `→` after opening the journal for writing, truncating it (restored from git). PowerShell 5.1's
+  `Set-Content -Encoding utf8` adds a byte-order mark. *Lesson: pass `encoding='utf-8'` in Python
+  and edit with the file tools.*

@@ -164,3 +164,18 @@ pub fn assert_valid(m: &EditableMesh) {
         errors.join("\n  ")
     );
 }
+
+/// Asserts that `op` fails with exactly `want`, leaving the mesh unchanged and valid.
+#[track_caller]
+pub fn assert_refused<T: std::fmt::Debug>(
+    m: &mut EditableMesh,
+    op: impl FnOnce(&mut EditableMesh) -> Result<T, lowpoly_core::mesh::MeshError>,
+    want: &lowpoly_core::mesh::MeshError,
+) {
+    let before = m.to_data();
+    let result = op(m);
+    let got = result.expect_err("the operation should be refused");
+    assert_eq!(&got, want, "wrong refusal");
+    assert_eq!(m.to_data(), before, "a refused operation changed the mesh");
+    assert_valid(m);
+}

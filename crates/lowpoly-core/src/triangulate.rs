@@ -16,8 +16,14 @@ use crate::mesh::{EditableMesh, FaceId, HalfEdgeId};
 #[derive(Default)]
 pub struct Triangulator {
     earcut: Earcut<f64>,
-    coords: Vec<[f64; 2]>,
+    /// Points of the polygon being triangulated, flattened over its loops.
+    points: Vec<DVec3>,
+    /// Start index of each hole in `points`.
     holes: Vec<u32>,
+    /// The points projected onto the polygon's plane.
+    coords: Vec<[f64; 2]>,
+    /// Triangles of the current polygon, before offsetting into the caller's buffer.
+    triangles: Vec<u32>,
 }
 
 impl fmt::Debug for Triangulator {
@@ -38,37 +44,87 @@ impl Triangulator {
     /// A degenerate outer loop (for example collinear points) with no holes becomes a fan, so
     /// the face still exists for picking and export.
     pub fn triangulate(&mut self, loops: &[impl AsRef<[DVec3]>], out: &mut Vec<u32>) {
-        out.clear();
-        let Some(outer) = loops.first().map(AsRef::as_ref) else {
-            return;
-        };
-        if outer.len() < 3 {
-            return;
-        }
-        let n = newell_normal(outer).normalize_or_zero();
-        let (u, v) = plane_basis(if n == DVec3::ZERO { DVec3::Z } else { n });
-
-        self.coords.clear();
+        self.points.clear();
         self.holes.clear();
-        for (i, l) in loops.iter().enumerate() {
+        for (i, points) in loops.iter().map(AsRef::as_ref).enumerate() {
             if i > 0 {
-                self.holes.push(index(self.coords.len()));
+                self.holes.push(index(self.points.len()));
             }
-            self.coords
-                .extend(l.as_ref().iter().map(|p| [p.dot(u), p.dot(v)]));
+            self.points.extend_from_slice(points);
         }
-        self.earcut
-            .earcut(self.coords.iter().copied(), &self.holes, out);
+        let outer_len = loops.first().map_or(0, |l| l.as_ref().len());
+        self.run(outer_len);
+        out.clear();
+        out.extend_from_slice(&self.triangles);
+    }
 
-        if out.is_empty() && loops.len() == 1 {
-            out.extend((1..index(outer.len()) - 1).flat_map(|i| [0, i, i + 1]));
+    /// Triangulates face `f` of `mesh`, appending its corners (half-edges, over the outer loop
+    /// then holes) to `corners` and its triangles to `indices`, as indices into `corners`. Lets a
+    /// caller build one buffer pair for a whole mesh without per-face allocation.
+    pub fn triangulate_face_into(
+        &mut self,
+        mesh: &EditableMesh,
+        f: FaceId,
+        corners: &mut Vec<HalfEdgeId>,
+        indices: &mut Vec<u32>,
+    ) {
+        let base = corners.len();
+        self.points.clear();
+        self.holes.clear();
+        let mut outer_len = 0;
+        for (i, l) in mesh.face_loops(f).enumerate() {
+            if i > 0 {
+                self.holes.push(index(self.points.len()));
+            }
+            let start = corners.len();
+            corners.extend(mesh.loop_half_edges(l));
+            self.points.extend(
+                corners[start..]
+                    .iter()
+                    .map(|&h| mesh.position(mesh.origin(h))),
+            );
+            if i == 0 {
+                outer_len = corners.len() - start;
+            }
+        }
+        self.run(outer_len);
+        let offset = index(base);
+        indices.extend(self.triangles.iter().map(|&i| i + offset));
+    }
+
+    /// Triangulates face `f` of `mesh` into fresh buffers.
+    pub fn triangulate_face(&mut self, mesh: &EditableMesh, f: FaceId) -> FaceTriangulation {
+        let mut corners = Vec::new();
+        let mut indices = Vec::new();
+        self.triangulate_face_into(mesh, f, &mut corners, &mut indices);
+        FaceTriangulation { corners, indices }
+    }
+
+    /// Triangulates `self.points` (outer loop of `outer_len` points, then the holes starting at
+    /// `self.holes`) into `self.triangles`.
+    fn run(&mut self, outer_len: usize) {
+        self.triangles.clear();
+        if outer_len < 3 {
+            return;
+        }
+        let n = newell_normal(self.points[..outer_len].iter().copied()).normalize_or_zero();
+        let (u, v) = plane_basis(if n == DVec3::ZERO { DVec3::Z } else { n });
+        self.coords.clear();
+        self.coords
+            .extend(self.points.iter().map(|p| [p.dot(u), p.dot(v)]));
+        self.earcut
+            .earcut_slice(&self.coords, &self.holes, &mut self.triangles);
+
+        if self.triangles.is_empty() && self.holes.is_empty() {
+            let last = index(outer_len) - 1;
+            self.triangles.extend((1..last).flat_map(|i| [0, i, i + 1]));
             return;
         }
 
         // Make every triangle counter-clockwise in the plane (u × v = n, so CCW in 2D is CCW
         // about n).
-        for tri in out.as_chunks_mut::<3>().0 {
-            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| DVec2::from(self.coords[i as usize]));
+        for tri in self.triangles.as_chunks_mut::<3>().0 {
+            let [a, b, c] = tri.map(|i| DVec2::from(self.coords[i as usize]));
             if (b - a).perp_dot(c - a) < 0.0 {
                 tri.swap(1, 2);
             }
@@ -84,33 +140,13 @@ pub fn triangulate_polygon(loops: &[impl AsRef<[DVec3]>]) -> Vec<u32> {
 }
 
 /// The triangles of one face.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FaceTriangulation {
     /// The face's corners, flattened over the outer loop then holes. Each half-edge gives a
     /// corner's position (its origin) and UV.
     pub corners: Vec<HalfEdgeId>,
     /// Triangle indices into `corners`.
     pub indices: Vec<u32>,
-}
-
-impl Triangulator {
-    /// Triangulates a face of `mesh`.
-    pub fn triangulate_face(&mut self, mesh: &EditableMesh, f: FaceId) -> FaceTriangulation {
-        let loops: Vec<Vec<HalfEdgeId>> = mesh
-            .face_loops(f)
-            .map(|l| mesh.loop_half_edges(l).collect())
-            .collect();
-        let positions: Vec<Vec<DVec3>> = loops
-            .iter()
-            .map(|l| l.iter().map(|&h| mesh.position(mesh.origin(h))).collect())
-            .collect();
-        let mut indices = Vec::new();
-        self.triangulate(&positions, &mut indices);
-        FaceTriangulation {
-            corners: loops.into_iter().flatten().collect(),
-            indices,
-        }
-    }
 }
 
 fn index(i: usize) -> u32 {

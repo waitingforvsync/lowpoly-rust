@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+# Benchmarks live in benches/; this lets `cargo bench -p lowpoly-core -- <criterion flags>` work.
+bench = false
+
 [dependencies]
 earcut.workspace = true
 glam.workspace = true
@@ -14,6 +18,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 serde_json.workspace = true
 criterion.workspace = true
 

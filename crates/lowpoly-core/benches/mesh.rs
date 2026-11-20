@@ -48,7 +48,23 @@ fn benches(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("triangulate 100x100 grid", |b| {
+    c.bench_function("20 sequential edge splits on one copy", |b| {
+        let edges: Vec<_> = (0..20)
+            .map(|i| {
+                mesh.find_edge(VertId::new(5000 + i * 101), VertId::new(5001 + i * 101))
+                    .expect("grid edge")
+            })
+            .collect();
+        b.iter(|| {
+            let mut copy = mesh.clone();
+            for &e in &edges {
+                black_box(copy.split_edge(e, 0.5).expect("split succeeds"));
+            }
+            copy
+        });
+    });
+
+    c.bench_function("triangulate 100x100 grid (buffers per face)", |b| {
         let mut triangulator = Triangulator::new();
         b.iter(|| {
             for f in mesh.faces() {
@@ -56,6 +72,26 @@ fn benches(c: &mut Criterion) {
             }
         });
     });
+
+    c.bench_function("triangulate 100x100 grid (shared buffers)", |b| {
+        let mut triangulator = Triangulator::new();
+        let mut corners = Vec::new();
+        let mut indices = Vec::new();
+        b.iter(|| {
+            corners.clear();
+            indices.clear();
+            for f in mesh.faces() {
+                triangulator.triangulate_face_into(&mesh, f, &mut corners, &mut indices);
+            }
+            black_box(indices.len())
+        });
+    });
+
+    c.bench_function("face normal of every face of a 100x100 grid", |b| {
+        b.iter(|| mesh.faces().map(|f| mesh.face_normal(f)).sum::<DVec3>());
+    });
+
+    c.bench_function("validate 100x100 grid", |b| b.iter(|| mesh.validate()));
 
     let data = mesh.to_data();
     c.bench_function("load 100x100 grid from MeshData", |b| {

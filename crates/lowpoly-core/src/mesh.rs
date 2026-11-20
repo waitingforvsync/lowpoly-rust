@@ -3,9 +3,10 @@
 //! # Structure
 //!
 //! - Every undirected edge owns two half-edges pointing in opposite directions. They are
-//!   allocated as a pair, so a half-edge's twin is `index ^ 1` and its edge is `index / 2`.
+//!   allocated as a pair, so a half-edge's twin is `index ^ 1` and its edge is `index / 2`
+//!   ([`HalfEdgeId::twin`], [`HalfEdgeId::edge`], [`EdgeId::half_edge`]).
 //! - A half-edge on a face loop has a loop, `next` and `prev`. A half-edge on the open boundary
-//!   (or either half of a wire edge) has no loop and no `next`/`prev`.
+//!   (or either half of a wire edge) has no loop, no `next`/`prev`, and a zero UV.
 //! - A face owns an outer loop (counter-clockwise about its normal) and any number of hole loops
 //!   (clockwise), chained from the outer loop.
 //! - Each vertex has an unordered list of outgoing half-edges, threaded through the half-edges
@@ -15,30 +16,31 @@
 //!   two faces and neighbouring faces always wind consistently.
 //! - A UV lives on the half-edge: it is the UV of the face corner at the half-edge's origin.
 //!
-//! # Storage
+//! # Storage and handles
 //!
-//! Each attribute is a separate [`CowVec`](crate::cow_vec::CowVec), so cloning a mesh is O(1)
-//! and an edit copies only the chunks it touches. Elements are never moved or reused: removal
-//! marks them dead, and handles stay valid identifiers for as long as the mesh value exists. New
-//! elements are appended.
+//! Each attribute is a separate copy-on-write chunked array, so cloning a mesh is O(1) and an
+//! edit copies only the chunks it touches. Storage is append-only: removal marks an element dead,
+//! and new elements are appended, so a handle never comes to mean a different element. The one
+//! exception is deliberate: when an operator rebuilds a face it reuses the face's slot, so the
+//! face keeps its id (its loops are new, so loop ids from before the rebuild go stale).
 //!
 //! # Files
 //!
 //! - `handles`: the typed element indices.
 //! - `editable_mesh`: [`EditableMesh`], its storage records and its queries.
-//! - `primitives`: adding and removing vertices, edges and faces; transactions.
+//! - `elements`: adding and removing vertices, edges and faces; transactions.
 //! - `euler`: topological operators (split, join, holes).
 //! - `validate`: invariant checks.
 
 mod editable_mesh;
+mod elements;
 mod error;
 mod euler;
 mod handles;
-mod primitives;
 mod validate;
 
 pub use editable_mesh::{Corner, EditableMesh, Shading};
+pub use elements::RemoveFace;
 pub use error::MeshError;
 pub use euler::{AddedHole, HoleFill};
 pub use handles::{EdgeId, FaceId, HalfEdgeId, LoopId, MaterialId, VertId};
-pub use primitives::RemoveFace;

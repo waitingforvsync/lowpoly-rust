@@ -1,9 +1,9 @@
-//! The lowpoly document model: meshes, modelling operations, history and file formats.
+//! The lowpoly document model: meshes, modelling operations and file formats.
 //!
 //! This crate is pure: it has no dependency on egui, wgpu or any platform API, so everything in
 //! it is unit-tested on the host with `cargo test`.
 
-pub mod cow_vec;
+mod cow_vec;
 pub mod math;
 pub mod mesh;
 pub mod mesh_data;

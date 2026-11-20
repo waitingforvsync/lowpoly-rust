@@ -10,11 +10,14 @@ const FOV_Y: f64 = 45.0 * PI / 180.0;
 /// Near clip distance. The far plane is at infinity (reverse-Z).
 const NEAR: f64 = 0.01;
 
+/// Closest the camera may zoom to its target, as in the TS app's orbit controls.
 const MIN_DISTANCE: f64 = 0.1;
+/// Farthest the camera may zoom from its target, as in the TS app's orbit controls.
 const MAX_DISTANCE: f64 = 1000.0;
 
 /// The orthographic eye sits this far back from the target, so the scene isn't clipped.
 const ORTHO_EYE_DISTANCE: f64 = 500.0;
+/// Far clip distance of the orthographic projection, measured from its eye.
 const ORTHO_FAR: f64 = ORTHO_EYE_DISTANCE * 4.0;
 
 /// Keeps the camera just short of looking straight down or up, where yaw is undefined.
@@ -35,7 +38,7 @@ pub enum Projection {
 /// The camera is described by its target, its distance from the target, and the direction it
 /// looks from (yaw about +Z, measured from +X, and pitch above the ground plane). All matrices
 /// use wgpu conventions with **reverse-Z** depth: near maps to 1, far to 0, so render passes clear
-/// depth to 0 and test with `Greater`.
+/// depth to 0 and test with `GreaterEqual`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrbitCamera {
     target: DVec3,
@@ -53,7 +56,9 @@ impl Default for OrbitCamera {
 }
 
 impl OrbitCamera {
-    /// Creates a perspective camera at `eye`, looking at `target`.
+    /// Creates a perspective camera at `eye`, looking at `target`. The distance is clamped to the
+    /// allowed zoom range and the pitch to just short of vertical, so [`eye`](Self::eye) can
+    /// differ slightly from `eye`.
     pub fn new(eye: DVec3, target: DVec3) -> Self {
         let offset = eye - target;
         let distance = offset.length().clamp(MIN_DISTANCE, MAX_DISTANCE);
@@ -237,10 +242,22 @@ mod tests {
 
     #[test]
     fn world_up_is_screen_up() {
-        let camera = OrbitCamera::default();
-        let below = ndc(&camera, camera.target());
-        let above = ndc(&camera, camera.target() + DVec3::Z * 0.1);
-        assert!(above.y > below.y, "{above} should be above {below}");
+        for camera in both_projections() {
+            let below = ndc(&camera, camera.target());
+            let above = ndc(&camera, camera.target() + DVec3::Z * 0.1);
+            assert!(
+                above.y > below.y,
+                "{:?}: {above} should be above {below}",
+                camera.projection()
+            );
+        }
+    }
+
+    #[test]
+    fn world_x_is_screen_right_from_the_front() {
+        let camera = OrbitCamera::new(DVec3::new(0.0, -5.0, 0.0), DVec3::ZERO);
+        let right = ndc(&camera, DVec3::X * 0.1);
+        assert!(right.x > 0.0, "+X should be on the right: {right}");
     }
 
     #[test]
@@ -258,6 +275,29 @@ mod tests {
                 "depth in range"
             );
         }
+    }
+
+    #[test]
+    fn perspective_depth_is_one_at_the_near_plane_and_falls_towards_zero() {
+        let camera = OrbitCamera::default();
+        let forward = -camera.back();
+        let at = |d: f64| ndc(&camera, camera.eye() + forward * d).z;
+        assert!((at(NEAR) - 1.0).abs() < 1e-9, "near plane: {}", at(NEAR));
+        assert!(
+            (at(2.0 * NEAR) - 0.5).abs() < 1e-9,
+            "depth = NEAR / distance"
+        );
+        assert!(at(1e6) < 1e-7, "distant points approach 0: {}", at(1e6));
+    }
+
+    #[test]
+    fn orthographic_depth_spans_near_to_far() {
+        let mut camera = OrbitCamera::default();
+        camera.set_projection(Projection::Orthographic);
+        let forward = -camera.back();
+        let at = |d: f64| ndc(&camera, camera.eye() + forward * d).z;
+        assert!((at(NEAR) - 1.0).abs() < 1e-9, "near plane: {}", at(NEAR));
+        assert!(at(ORTHO_FAR).abs() < 1e-9, "far plane: {}", at(ORTHO_FAR));
     }
 
     #[test]
@@ -326,6 +366,15 @@ mod tests {
             view.is_finite(),
             "view matrix stays finite looking straight down"
         );
+    }
+
+    #[test]
+    fn orbit_half_height_drag_turns_halfway_round() {
+        let mut camera = OrbitCamera::default();
+        let before = camera.eye() - camera.target();
+        camera.orbit(DVec2::new(450.0, 0.0), 900.0);
+        let after = camera.eye() - camera.target();
+        assert_close(after, DVec3::new(-before.x, -before.y, before.z));
     }
 
     #[test]

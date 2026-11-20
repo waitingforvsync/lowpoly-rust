@@ -6,7 +6,7 @@ mod common;
 use common::{assert_valid, cube_data, mesh, square_with_hole_data, two_triangles_data, v};
 use glam::DVec2;
 use lowpoly_core::mesh::{FaceId, MeshError};
-use lowpoly_core::mesh_data::{CornerData, FaceData, LoadMeshError, MeshData, VertData};
+use lowpoly_core::mesh_data::{CornerData, DataRef, FaceData, LoadMeshError, MeshData, VertData};
 
 #[test]
 fn round_trips_fixtures_exactly() {
@@ -45,8 +45,8 @@ fn builds_hole_loops() {
     );
     // Hole edges are boundary edges: the face on one side, open on the other.
     for h in m.loop_half_edges(holes[0]) {
-        assert!(m.is_boundary(m.edge_of(h)));
-        assert!(m.face_of(m.twin(h)).is_none());
+        assert!(m.is_boundary(h.edge()));
+        assert!(m.face_of(h.twin()).is_none());
     }
 }
 
@@ -56,7 +56,7 @@ fn preserves_per_corner_uvs() {
     let h = m.find_half_edge(v(1), v(3)).unwrap();
     assert_eq!(m.face_of(h), Some(FaceId::new(0)));
     assert_eq!(m.uv(h), DVec2::new(1.0, 0.0));
-    let t = m.twin(h);
+    let t = h.twin();
     assert_eq!(m.face_of(t), Some(FaceId::new(1)));
     assert_eq!(m.uv(t), DVec2::new(0.0, 1.0));
 }
@@ -215,7 +215,10 @@ fn rejects_a_loop_with_fewer_than_3_corners() {
 fn rejects_an_unknown_vertex() {
     assert_eq!(
         rejects(|d| d.faces[0].loops[0][0].v = 99),
-        LoadMeshError::UnknownVertex(99)
+        LoadMeshError::UnknownVertex {
+            vertex: 99,
+            referrer: DataRef::Face(0)
+        }
     );
 }
 
@@ -245,7 +248,7 @@ fn rejects_a_wire_edge_duplicating_a_face_edge() {
         matches!(
             err,
             LoadMeshError::InvalidWireEdge {
-                source: MeshError::EdgeExists(..),
+                source: MeshError::EdgeExists { .. },
                 ..
             }
         ),
@@ -258,5 +261,78 @@ fn rejects_an_unknown_soft_edge() {
     assert_eq!(
         rejects(|d| d.soft_edges.push([0, 6])),
         LoadMeshError::UnknownSoftEdge(0, 6)
+    );
+}
+
+#[test]
+fn rejects_an_unknown_vertex_in_a_wire_edge() {
+    assert_eq!(
+        rejects(|d| d.wire_edges.push([0, 42])),
+        LoadMeshError::UnknownVertex {
+            vertex: 42,
+            referrer: DataRef::WireEdge(0, 42)
+        }
+    );
+}
+
+#[test]
+fn load_errors_name_the_element_without_repeating_the_cause() {
+    use std::error::Error as _;
+    let err = rejects(|d| d.faces[0].loops[0][1].v = 0);
+    assert_eq!(err.to_string(), "invalid face 0");
+    let cause = err.source().expect("the mesh error is the source");
+    assert_eq!(
+        cause.to_string(),
+        "vertex 0 appears more than once in the face"
+    );
+}
+
+#[test]
+fn saving_a_mesh_with_dead_elements_compacts_on_reload() {
+    let mut m = mesh(&cube_data());
+    m.remove_face(
+        FaceId::new(1),
+        lowpoly_core::mesh::RemoveFace {
+            wire_edges: true,
+            isolated_verts: true,
+        },
+    )
+    .unwrap();
+    m.split_edge(m.find_edge(v(0), v(1)).unwrap(), 0.5).unwrap();
+    let sparse = m.to_data();
+    assert_eq!(sparse.next_face_id, 6, "slot counts include dead faces");
+
+    let reloaded = mesh(&sparse);
+    assert_valid(&reloaded);
+    assert_eq!(reloaded.vert_count(), m.vert_count());
+    assert_eq!(reloaded.edge_count(), m.edge_count());
+    assert_eq!(reloaded.face_count(), m.face_count());
+    let compact = reloaded.to_data();
+    assert!(
+        compact.faces.iter().zip(0..).all(|(f, i)| f.id == i),
+        "dense face ids"
+    );
+    assert_eq!(
+        mesh(&compact).to_data(),
+        compact,
+        "compaction is idempotent"
+    );
+}
+
+/// Two triangles exactly as the TypeScript app's `JSON.stringify(toMeshData(..))` writes them:
+/// integral numbers have no fractional part, and keys follow `toMeshData`'s order.
+const TS_TWO_TRIANGLES: &str = r#"{"verts":[{"id":0,"p":[0,0,0]},{"id":1,"p":[1,0,0]},{"id":2,"p":[1,1,0]},{"id":3,"p":[0,1,0]}],"faces":[{"id":0,"material":0,"loops":[[{"v":0,"uv":[0,0]},{"v":1,"uv":[1,0]},{"v":3,"uv":[0,1]}]]},{"id":1,"material":1,"loops":[[{"v":1,"uv":[1,0]},{"v":2,"uv":[1,1]},{"v":3,"uv":[0,1]}]]}],"wireEdges":[],"softEdges":[],"nextVertId":4,"nextFaceId":2}"#;
+
+#[test]
+fn reads_mesh_json_written_by_the_typescript_app() {
+    let data: MeshData = serde_json::from_str(TS_TWO_TRIANGLES).unwrap();
+    assert_eq!(data, two_triangles_data());
+    let reparsed: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&mesh(&data).to_data()).unwrap()).unwrap();
+    let original: serde_json::Value = serde_json::from_str(TS_TWO_TRIANGLES).unwrap();
+    assert_eq!(
+        reparsed.as_object().unwrap().keys().collect::<Vec<_>>(),
+        original.as_object().unwrap().keys().collect::<Vec<_>>(),
+        "same top-level keys"
     );
 }

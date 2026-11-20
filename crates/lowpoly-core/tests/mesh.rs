@@ -110,7 +110,7 @@ fn guards_edge_and_vertex_removal() {
     let e = m.find_edge(v(0), v(1)).unwrap();
     assert_eq!(
         m.remove_edge(e),
-        Err(MeshError::EdgeBordersFace(v(0), v(1)))
+        Err(MeshError::EdgeBordersFace { a: v(0), b: v(1) })
     );
     assert_eq!(
         m.remove_vertex(v(0)),
@@ -121,7 +121,7 @@ fn guards_edge_and_vertex_removal() {
     );
     assert_eq!(
         m.add_edge(v(0), v(1)),
-        Err(MeshError::EdgeExists(v(0), v(1)))
+        Err(MeshError::EdgeExists { a: v(0), b: v(1) })
     );
     assert_eq!(m.add_edge(v(0), v(0)), Err(MeshError::SelfEdge(v(0))));
 }
@@ -195,4 +195,26 @@ fn removed_elements_keep_their_slots_and_handles_are_not_reused() {
     assert_eq!(f, FaceId::new(1), "a new face gets a new handle");
     assert!(!m.contains_face(FaceId::new(0)));
     assert_valid(&m);
+}
+
+#[test]
+fn rejects_handles_of_removed_elements() {
+    let mut m = mesh(&quad_data());
+    let e = m.find_edge(v(0), v(1)).unwrap();
+    m.remove_face(
+        FaceId::new(0),
+        RemoveFace {
+            wire_edges: true,
+            isolated_verts: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        m.remove_face(FaceId::new(0), RemoveFace::default()),
+        Err(MeshError::NoSuchFace(FaceId::new(0)))
+    );
+    assert_eq!(m.remove_edge(e), Err(MeshError::NoSuchEdge(e)));
+    assert_eq!(m.remove_vertex(v(0)), Err(MeshError::NoSuchVertex(v(0))));
+    assert_eq!(m.add_edge(v(0), v(1)), Err(MeshError::NoSuchVertex(v(0))));
+    assert!(!m.contains_vert(v(0)) && !m.contains_edge(e));
 }

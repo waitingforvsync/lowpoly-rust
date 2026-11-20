@@ -24,7 +24,7 @@ Then:
 ```sh
 cargo run -p lowpoly-app --release     # desktop
 trunk serve                            # web dev server at http://127.0.0.1:8080, rebuilds on change
-trunk build --release                  # static site in dist/ (relative URLs, host anywhere)
+trunk build --release --cargo-profile wasm-release   # static site in dist/, as deployed
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings

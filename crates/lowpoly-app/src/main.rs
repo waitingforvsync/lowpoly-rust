@@ -27,7 +27,6 @@ fn main() -> eframe::Result {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    use eframe::wasm_bindgen::JsCast as _;
     use eframe::{egui_wgpu, wgpu};
 
     // Forward `log` output to the browser console. Failing means a logger is already set.
@@ -41,22 +40,11 @@ fn main() {
     }
 
     wasm_bindgen_futures::spawn_local(async {
-        let document = eframe::web_sys::window()
-            .and_then(|window| window.document())
-            .expect("running in a browser page");
-        let canvas = document
-            .get_element_by_id("lowpoly_canvas")
-            .expect("index.html has a #lowpoly_canvas element")
-            .dyn_into::<eframe::web_sys::HtmlCanvasElement>()
-            .expect("#lowpoly_canvas is a <canvas>");
-
-        let result = eframe::WebRunner::new()
-            .start(
-                canvas,
-                web_options,
-                Box::new(|cc| Ok(Box::new(LowpolyApp::new(cc)?))),
-            )
-            .await;
+        let Some(document) = eframe::web_sys::window().and_then(|window| window.document()) else {
+            log::error!("not running in a browser page");
+            return;
+        };
+        let result = start(&document, web_options).await;
 
         // Replace the loading text with the outcome.
         if let Some(status) = document.get_element_by_id("loading_text") {
@@ -66,9 +54,32 @@ fn main() {
                     status.set_inner_html(
                         "<p>Lowpoly failed to start. See the browser console for details.</p>",
                     );
-                    log::error!("failed to start: {error:?}");
+                    log::error!("failed to start: {error}");
                 }
             }
         }
     });
+}
+
+/// Finds the canvas and starts the app on it.
+#[cfg(target_arch = "wasm32")]
+async fn start(
+    document: &eframe::web_sys::Document,
+    web_options: eframe::WebOptions,
+) -> Result<(), String> {
+    use eframe::wasm_bindgen::JsCast as _;
+
+    let canvas = document
+        .get_element_by_id("lowpoly_canvas")
+        .ok_or("index.html has no #lowpoly_canvas element")?
+        .dyn_into::<eframe::web_sys::HtmlCanvasElement>()
+        .map_err(|_| "#lowpoly_canvas is not a <canvas>")?;
+    eframe::WebRunner::new()
+        .start(
+            canvas,
+            web_options,
+            Box::new(|cc| Ok(Box::new(LowpolyApp::new(cc)?))),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))
 }

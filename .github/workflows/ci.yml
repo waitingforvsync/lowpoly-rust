@@ -1,9 +1,18 @@
-# Format, lint (native and wasm) and test on every push and pull request.
+# Format, lint (native and wasm), test and build docs on pushes to main and on pull requests.
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes a running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,9 +30,9 @@ jobs:
       # Headers eframe's native (winit) backend needs to compile on Linux.
       - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo doc --workspace --no-deps
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
