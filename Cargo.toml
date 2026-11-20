@@ -17,6 +17,11 @@ egui = "0.37"
 glam = "0.34"
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+earcut = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+criterion = { version = "0.8", default-features = false }
 
 # Lints follow BeautifulRust (https://github.com/morganlinton/BeautifulRust), adapted for an
 # application workspace: the library-only lints (exhaustive_enums, print_*) are dropped, and
@@ -64,6 +69,10 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 module_inception = "allow"
 enum_glob_use = "allow"
+# Geometry code reads best with conventional short names (u, v, n, a, b) and paired names
+# (loop_a / loops_a).
+many_single_char_names = "allow"
+similar_names = "allow"
 
 [profile.release]
 opt-level = 3

@@ -40,3 +40,47 @@ way (with what they taught). See [PLAN.md](PLAN.md) for the roadmap.
   requesting a repaint while `is_scrolling()`.
 - **Synthetic browser input**: eframe reads mouse moves from `mousemove`, not `pointermove`. Browser
   tests must dispatch a `mousemove` before wheel or drag events, or egui has no hover position.
+
+---
+
+## R1 — Mesh core (2026-11-20)
+
+### Decisions
+- **Half-edges are allocated in twin pairs**: twin = `index ^ 1`, edge = `index / 2`. Twin and
+  edge pointers can't be inconsistent, there's no edge-to-half-edge field, and an edge's primary
+  half-edge keeps the TS meaning of `edge.he` (its creation direction).
+- **Handles wrap `NonZeroU32`** (storing index + 1), so `Option<HalfEdgeId>` is 4 bytes and a
+  half-edge record is 20 bytes. Faces chain their holes through the loops, and vertices thread
+  their out lists through the half-edges, so every record is fixed-size and fits in a chunk.
+- **One `CowVec` per attribute**: positions, vertex links, half-edge links, UVs, edges, loops,
+  faces. Elements are append-only with an `alive` flag. Faces rebuilt by an operator reuse their
+  slot, so they keep their id; their loops are new.
+- **The chunk table is shared too** (`Arc<Vec<Arc<[T; 64]>>>`). Cloning a mesh is then O(1), and
+  each attribute pays for a table copy only when first written. On a 100×100 grid: clone + move one
+  vertex went from 18.7 µs to 1.5 µs, and a transactional `split_edge` from 39 µs to 21 µs.
+  The cost: writes to an unshared mesh do two `Arc` uniqueness checks instead of one, so building
+  the grid went from 2.6 ms to 4.5 ms. Clones happen on every edit, bulk builds only on load and
+  import, so this is the right trade. A batch-edit scope that checks uniqueness once per chunk is
+  the next step if write-heavy operations ever show up in profiles.
+- **Transactions replace hand-written rollback**: `EditableMesh::transaction` runs an edit on a shared
+  copy and commits on success. Euler operators check what they can up front, then rebuild faces
+  inside a transaction.
+- **`find_edge` walks the out list** (O(valence)) instead of keeping a vertex-pair hash map, which
+  would need its own structurally shared storage.
+- **File ids are remapped on load** to dense handles; `nextVertId`/`nextFaceId` become slot counts.
+  See PORTING.md.
+- **earcut** is the georust port of mapbox earcut 3.x, the same algorithm as the TS app, with
+  reusable buffers (`Triangulator`).
+- **Lints**: `many_single_char_names` and `similar_names` are allowed workspace-wide; geometry code
+  reads best with `u`, `v`, `n`, `a`, `b` and paired names like `loop_a`/`loops_a`.
+
+### Mistakes
+- A ported test moved a cube corner and then asserted the copy was still valid. It isn't (faces
+  bend), and `validate` said so. The test now checks independence only.
+- **Module layout**: the mesh started as one 800-line `mesh/mod.rs`. Moved to the modern
+  convention (`mesh.rs` holding only `mod` and `pub use`, items in `mesh/*.rs`), and renamed the type
+  `EditableMesh` (in `mesh/editable_mesh.rs`) so the module root stays a thin index. Storage records
+  and fields are `pub(super)` so the sibling files (primitives, Euler operators, validation) can
+  reach them.
+- `cargo bench -p lowpoly-core -- <criterion flags>` passes the flags to the lib's test harness
+  too, which rejects them. Use `--bench mesh`.

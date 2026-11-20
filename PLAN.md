@@ -39,7 +39,8 @@ Cargo.toml                 workspace, shared [lints], [profile.release]
 crates/
   lowpoly-core/            pure model: no egui, no wgpu, no platform code
     math/                  plane fit (Newell), projection, ray/segment helpers
-    mesh/                  Mesh (arena half-edge), handles, Euler ops, queries, validate
+    mesh.rs                module root: re-exports only
+    mesh/                  EditableMesh (index-based half-edge), handles, primitives, Euler ops, validate
     file_format.rs         MeshData + document DTOs (serde), TS-compatible JSON
     ops/                   push/pull, extrude, inset, loop cut, merge, dissolve, planarize, draw, ...
     uv/                    projection, texture-lock continuation
@@ -72,7 +73,7 @@ on the host, and so the core cannot accidentally pick up a GPU or browser depend
 
 | TS original | Why it existed | Rust design |
 |---|---|---|
-| `MeshData` does two jobs: the file format, **and** the in-memory snapshot form for undo (the half-edge graph is converted to `MeshData` on every mesh edit and rebuilt from it on every undo) | A JS object graph of half-edges can't be cheaply cloned | **Still two forms, each with one job.** `MeshData` is only the serialized format (serde, TS-compatible), used at save/load/export. The runtime `Mesh` is index-based half-edge storage with structural sharing (see [Document model and undo](#document-model-and-undo)), so it is its own undo snapshot. No conversion on the edit/undo path. |
+| `MeshData` does two jobs: the file format, **and** the in-memory snapshot form for undo (the half-edge graph is converted to `MeshData` on every mesh edit and rebuilt from it on every undo) | A JS object graph of half-edges can't be cheaply cloned | **Still two forms, each with one job.** `MeshData` is only the serialized format (serde, TS-compatible), used at save/load/export. The runtime `EditableMesh` is index-based half-edge storage with structural sharing (see [Document model and undo](#document-model-and-undo)), so it is its own undo snapshot. No conversion on the edit/undo path. |
 | Command pattern: each command mutates the live document in `apply()` and hand-writes its inverse in `revert()` | OO idiom; no cheap snapshots | **Value-oriented history** (after Juan Pedro Bolívar Puente's immer/lager): the document is a value, history is a list of document values. No inverses to write or get wrong. |
 | Throw `MeshError`, catch, roll back pointer surgery | Exceptions | Ops return `Result<_, MeshError>` and run on a working copy of the document (cheap thanks to sharing). On error the copy is dropped, so a failed op can't leave a half-edited mesh, by construction. |
 | Preact signals; panels re-render on change | Reactive UI | egui immediate mode reads editor state each frame. UI events become an `Action` enum handled by the editor (also useful for tests and key bindings). |
@@ -93,12 +94,12 @@ struct Document {
     materials: imbl::OrdMap<MaterialId, Arc<Material>>,
     textures: imbl::OrdMap<TextureId, Arc<TextureAsset>>, // image bytes shared, never copied
 }
-struct Object { name: String, transform: Transform, visible: bool, locked: bool, mesh: Arc<Mesh>, source: Option<PrimitiveSource> }
+struct Object { name: String, transform: Transform, visible: bool, locked: bool, mesh: Arc<EditableMesh>, source: Option<PrimitiveSource> }
 ```
 
 - Cloning a `Document` copies pointers only. Edits go through `Arc::make_mut` / `imbl`'s copy on
   write: a value owned by one holder is changed in place, and a shared one is copied first.
-- Modelling ops stay ordinary imperative code on `&mut Mesh`. Value semantics apply only at the
+- Modelling ops stay ordinary imperative code on `&mut EditableMesh`. Value semantics apply only at the
   document boundary.
 
 ### History
@@ -125,11 +126,13 @@ struct History { entries: Vec<Entry>, cursor: usize, saved: Option<Document> }
 - **Index-based throughout:** typed `u32` handles (`VertId`, `HalfEdgeId`, `EdgeId`, `LoopId`,
   `FaceId`), no pointers. An index means the same element in every version, which is what
   lets versions share storage.
-- **`CowVec<T, const N: usize>`**: a two-level chunked array, `Vec<Arc<[T; N]>>`. Reads are one extra
-  indirection (O(1), cache-friendly). The first write to a shared chunk copies only that chunk; a new
-  version copies only the chunk table (~5 KB for 40k elements). Chunk size is tunable (start at 64).
-  Chosen over `imbl::Vector` for meshes because half-edge traversal is dominated by random reads
-  and RRB tree walks would sit on the hot path. `imbl` is used at the document level only.
+- **`CowVec<T, const N: usize>`**: a two-level chunked array, `Arc<Vec<Arc<[T; N]>>>`. Cloning is
+  O(1) (the chunk table is shared too); the first write after a clone copies the table and the one
+  chunk written. Reads are O(1) and cache-friendly. Chunk size is tunable (64). Chosen over
+  `imbl::Vector` for meshes because half-edge traversal is dominated by random reads and RRB tree
+  walks would sit on the hot path. `imbl` is used at the document level only.
+- **Half-edges are allocated in twin pairs**: twin = `index ^ 1`, edge = `index / 2`, so twin and
+  edge links are structural and can't go wrong.
 - **One `CowVec` per attribute** (struct of arrays): positions, vertex links, half-edge
   connectivity, half-edge UVs, edge flags, loops, face attributes. Common edits touch one array:
   vertex moves copy only position chunks, UV edits only UV chunks, painting only face chunks.
@@ -141,7 +144,8 @@ struct History { entries: Vec<Entry>, cursor: usize, saved: Option<Document> }
   and written from indices on save.
 - **Per-vertex outgoing half-edges** (the TS design's unordered `out` list, needed because
   boundary half-edges have no next/prev) become an intrusive linked list: each half-edge stores
-  `next_out`, each vertex stores `first_out`. Everything stays fixed-size and fits in chunks.
+  `next_out`, each vertex stores `first_out`. Face holes chain through the loops the same way.
+  Everything stays fixed-size and fits in chunks.
 - **Cost model:** an edit copies the chunks it touches and never more than a full snapshot. A typical
   push/pull on a 10k-quad mesh copies tens of KB instead of ~2 MB. Global ops (apply scale,
   recalculate normals) pay a full copy, like any scheme.
@@ -224,7 +228,7 @@ The pipeline goes first so every later milestone is deployed and checked in the 
 
 **Phase B: core port (test-first, no UI)**
 
-- **R1 Mesh core.** Math, arena `Mesh` with holes, Euler ops, `validate`, triangulation, the
+- **R1 Mesh core.** Math, index-based `EditableMesh` with holes, Euler ops, `validate`, triangulation, the
   file-format DTO. Port `halfedge/*.test.ts`, `triangulate.test.ts`. First benchmarks.
 - **R2 Document, history, primitives, JSON I/O.** Port `history.test.ts`; load TS-saved JSON
   fixtures and round-trip them.

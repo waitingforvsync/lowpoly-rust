@@ -8,6 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+earcut.workspace = true
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "mesh"
+harness = false
 
 [lints]
 workspace = true

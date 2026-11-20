@@ -8,6 +8,7 @@ A minimalist low-poly mesh editor, for desktop and the web. A Rust port of the
 
 - [PLAN.md](PLAN.md): design, architecture and roadmap
 - [JOURNAL.md](JOURNAL.md): engineering decisions and mistakes along the way
+- [PORTING.md](PORTING.md): how the TypeScript code maps to the Rust port, and what differs
 
 ## Building
 
@@ -26,7 +27,8 @@ trunk serve                            # web dev server at http://127.0.0.1:8080
 trunk build --release                  # static site in dist/ (relative URLs, host anywhere)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p lowpoly-app --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
+cargo bench -p lowpoly-core --bench mesh     # mesh benchmarks (criterion)
 ```
 
 On Windows, run cargo from PowerShell or cmd rather than Git Bash: Git Bash's `/usr/bin/link`
