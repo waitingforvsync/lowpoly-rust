@@ -1,0 +1,29 @@
+[package]
+name = "lowpoly-app"
+description = "Lowpoly, a minimalist low-poly mesh editor, for desktop and the web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lowpoly"
+path = "src/main.rs"
+
+[dependencies]
+lowpoly-editor.workspace = true
+bytemuck.workspace = true
+eframe.workspace = true
+egui.workspace = true
+glam.workspace = true
+log.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
+[lints]
+workspace = true

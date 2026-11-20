@@ -1,0 +1,12 @@
+# BeautifulRust clippy configuration (https://github.com/morganlinton/BeautifulRust).
+
+# Flag any function with a bool parameter: use a two-variant enum or two methods instead.
+max-fn-params-bools = 0
+
+# Allow unwrap, expect, and printing in tests, where a panic is the assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+
+# Proper nouns that the doc_markdown lint would otherwise want in backticks.
+doc-valid-idents = ["SketchUp", "WebGL2", "WebGPU", ".."]
